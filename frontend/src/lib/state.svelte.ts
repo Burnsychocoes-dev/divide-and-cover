@@ -2,7 +2,7 @@
 // Components import `state` and `engine`; mutations flow through `engine.onUpdate -> state.player`.
 
 import { StemPlayer, STEMS, type PlayerSnapshot, type Stem } from './player';
-import type { Track } from './api';
+import type { PitchStatus, Track } from './api';
 
 class AppState {
   player = $state<PlayerSnapshot>({
@@ -14,6 +14,13 @@ class AppState {
   });
 
   currentTrack = $state<{ jobId: string; name: string } | null>(null);
+
+  /** Pitch version playing, in semitones (0 = original). */
+  pitch = $state(0);
+  /** Pitch version being downloaded/decoded by engine.swap(), if any. */
+  pitchSwitching = $state<number | null>(null);
+  /** Which pitch versions of the current track the server has rendered. */
+  pitchStatus = $state<PitchStatus | null>(null);
 
   tracks = $state<Track[]>([]);
 

@@ -88,16 +88,30 @@ export async function* readNdjson(res: Response): AsyncGenerator<StreamEvent> {
   if (tail) yield JSON.parse(tail) as StreamEvent;
 }
 
-export function stemUrlsFor(jobId: string): Record<Stem, string> {
+/** Pre-rendered pitch versions, in semitones (0 = the original stems). Mirrors app/pitch.py. */
+export const PITCH_SHIFTS = [-4, -2, 0, 2, 4] as const;
+
+export type PitchStatus = { ready: number[]; pending: number[]; failed: number[] };
+
+export function stemUrlsFor(jobId: string, pitch = 0): Record<Stem, string> {
   const out = {} as Record<Stem, string>;
-  for (const s of STEMS) out[s] = `/api/stem/${jobId}/${s}`;
+  const qs = pitch ? `?pitch=${pitch}` : '';
+  for (const s of STEMS) out[s] = `/api/stem/${jobId}/${s}${qs}`;
   return out;
 }
 
 /** URL that mixes the given stems into a single downloadable mp3. */
-export function mixUrl(jobId: string, stems: Stem[]): string {
+export function mixUrl(jobId: string, stems: Stem[], pitch = 0): string {
   const params = new URLSearchParams({ stems: stems.join(',') });
+  if (pitch) params.set('pitch', String(pitch));
   return `/api/mix/${jobId}?${params}`;
+}
+
+/** Which pitch versions of a track are playable. Also starts rendering missing ones server-side. */
+export async function fetchPitches(jobId: string): Promise<PitchStatus> {
+  const r = await fetch(`/api/tracks/${jobId}/pitches`);
+  if (!r.ok) throw new Error(`fetchPitches: ${r.status}`);
+  return r.json();
 }
 
 export async function listTracks(): Promise<Track[]> {

@@ -4,8 +4,8 @@
   import { lockScroll } from '$lib/actions/lockScroll';
   import { swipeDown } from '$lib/actions/swipeDown';
 
-  type Props = { open: boolean; jobId: string; onClose: () => void };
-  let { open, jobId, onClose }: Props = $props();
+  type Props = { open: boolean; jobId: string; pitch?: number; onClose: () => void };
+  let { open, jobId, pitch = 0, onClose }: Props = $props();
 
   let panelEl: HTMLDivElement | null = $state(null);
 
@@ -39,7 +39,7 @@
   function download() {
     if (selected.length === 0) return;
     const a = document.createElement('a');
-    a.href = mixUrl(jobId, selected);
+    a.href = mixUrl(jobId, selected, pitch);
     a.download = '';
     document.body.appendChild(a);
     a.click();
@@ -92,7 +92,8 @@
 
       <div class="px-5 py-4 flex flex-col gap-4">
         <p class="text-sm text-stone-500 dark:text-stone-400">
-          pick the tracks to mix into one file.
+          pick the tracks to mix into one file{#if pitch}, at the current pitch
+            ({pitch > 0 ? '+' : '−'}{Math.abs(pitch)} semitones){/if}.
         </p>
 
         <ul class="grid gap-2 list-none p-0 m-0">

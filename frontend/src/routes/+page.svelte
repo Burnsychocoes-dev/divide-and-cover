@@ -147,6 +147,10 @@
   function clearActiveTrack() {
     engine.pause();
     app.currentTrack = null;
+    // every load starts from the original stems
+    app.pitch = 0;
+    app.pitchSwitching = null;
+    app.pitchStatus = null;
   }
 
   async function onFile(file: File) {

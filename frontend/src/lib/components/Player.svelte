@@ -5,6 +5,7 @@
   import { renameTrack } from '$lib/api';
   import StemControls from './StemControls.svelte';
   import DownloadDialog from './DownloadDialog.svelte';
+  import PitchControl from './PitchControl.svelte';
 
   let downloadOpen = $state(false);
 
@@ -142,6 +143,7 @@
       {/if}
     </div>
     <div class="flex items-center gap-1 shrink-0 -mt-1 -mr-2">
+      <PitchControl />
       <!-- share: native share sheet on mobile, clipboard copy on desktop -->
       <button
         type="button"
@@ -244,6 +246,7 @@
   <DownloadDialog
     open={downloadOpen}
     jobId={app.currentTrack.jobId}
+    pitch={app.pitch}
     onClose={() => (downloadOpen = false)}
   />
 {/if}

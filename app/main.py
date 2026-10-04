@@ -1,5 +1,6 @@
 import asyncio
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -19,6 +21,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from . import jobs
+from .pitch import PITCH_SHIFTS, is_ready, render_pitch, stem_path
 
 ROOT = Path(__file__).parent
 TRACKS = Path(os.environ.get("DAC_TRACKS_DIR", str(ROOT.parent / "tracks")))
@@ -40,6 +43,9 @@ if USE_MODAL:
     modal_separate = modal.Function.from_name("divide-and-cover", "separate")
 else:
     modal_separate = None
+
+# pitch versions are rendered on this host's CPU (numpy), in worker processes
+PITCH_WORKERS = max(1, int(os.environ.get("DAC_PITCH_WORKERS", "2")))
 
 LRCLIB_BASE = "https://lrclib.net/api"
 LRC_USER_AGENT = "divide-and-cover/0.1 (+https://github.com/)"
@@ -135,6 +141,7 @@ async def _stream_separation_modal(src: Path, job_id: str, name: str, extra_meta
             return
         (final / f"{stem}.mp3").write_bytes(data)
     _write_meta(final, name, extra_meta)
+    _ensure_pitches(job_id)
     yield _done_event(job_id, name)
 
 
@@ -207,6 +214,7 @@ async def _stream_separation_local(src: Path, work_out: Path, job_id: str, name:
         for stem in STEMS:
             shutil.move(str(produced / f"{stem}.mp3"), str(final / f"{stem}.mp3"))
         _write_meta(final, name, extra_meta)
+        _ensure_pitches(job_id)
         yield _done_event(job_id, name)
     finally:
         if proc.returncode is None:
@@ -215,6 +223,72 @@ async def _stream_separation_local(src: Path, work_out: Path, job_id: str, name:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 proc.kill()
+
+
+# --- pitch versions ----------------------------------------------------------
+#
+# Every track gets pre-rendered pitch versions (see app/pitch.py) so the player
+# can change key instantly. Rendering starts right after a split and runs in
+# the background — the original stems are playable straight away and each
+# version unlocks as it lands. Tracks split before this feature (or whose
+# rendering was interrupted by a restart) are caught up the first time their
+# status is requested.
+
+_pitch_pool: ProcessPoolExecutor | None = None
+_pitch_tasks: dict[str, asyncio.Task] = {}
+_pitch_failed: dict[str, set[int]] = {}
+
+
+def _pitch_executor() -> ProcessPoolExecutor:
+    global _pitch_pool
+    if _pitch_pool is None:
+        # spawn, not fork: forking a process that runs an event loop + threads is unsafe
+        _pitch_pool = ProcessPoolExecutor(
+            max_workers=PITCH_WORKERS, mp_context=multiprocessing.get_context("spawn")
+        )
+    return _pitch_pool
+
+
+@app.on_event("shutdown")
+def _shutdown_pitch_pool() -> None:
+    if _pitch_pool is not None:
+        _pitch_pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _ensure_pitches(job_id: str) -> None:
+    """Start rendering a track's missing pitch versions. Idempotent."""
+    if job_id in _pitch_tasks:
+        return
+    d = TRACKS / job_id
+    failed = _pitch_failed.setdefault(job_id, set())
+    # nearest keys first, so ±2 unlock before ±4
+    todo = sorted(
+        (s for s in PITCH_SHIFTS if s and s not in failed and not is_ready(d, s, STEMS)),
+        key=lambda s: (abs(s), -s),
+    )
+    if not todo:
+        return
+
+    async def render(shift: int) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(_pitch_executor(), render_pitch, str(d), shift, STEMS)
+        except Exception as e:  # noqa: BLE001 — a failed version just stays unavailable
+            failed.add(shift)
+            print(f"[pitch] {job_id} {shift:+d} failed: {type(e).__name__}: {e}", flush=True)
+
+    async def run() -> None:
+        await asyncio.gather(*(render(s) for s in todo))
+
+    task = asyncio.create_task(run())
+    _pitch_tasks[job_id] = task
+    task.add_done_callback(lambda _: _pitch_tasks.pop(job_id, None))
+
+
+def _parse_pitch(pitch: int) -> int:
+    if pitch not in PITCH_SHIFTS:
+        raise HTTPException(400, "bad pitch")
+    return pitch
 
 
 async def _stream_separation(src: Path, work_out: Path, job_id: str, name: str, extra_meta: dict | None = None) -> AsyncIterator[bytes]:
@@ -541,7 +615,26 @@ def delete_track(job_id: str) -> dict:
     if not d.exists():
         raise HTTPException(404, "not found")
     shutil.rmtree(d)
+    _pitch_failed.pop(job_id, None)
     return {"ok": True}
+
+
+@app.get("/api/tracks/{job_id}/pitches")
+async def track_pitches(job_id: str) -> dict:
+    """Which pitch versions are playable. Also (re)starts rendering missing ones."""
+    # async: _ensure_pitches schedules a task on the running event loop
+    d = _track_dir(job_id)
+    if not d.exists():
+        raise HTTPException(404, "not found")
+    _ensure_pitches(job_id)
+    failed = _pitch_failed.get(job_id, set())
+    ready = [s for s in PITCH_SHIFTS if is_ready(d, s, STEMS)]
+    return {
+        "shifts": list(PITCH_SHIFTS),
+        "ready": ready,
+        "pending": [s for s in PITCH_SHIFTS if s not in ready and s not in failed],
+        "failed": sorted(failed),
+    }
 
 
 class TrackRename(BaseModel):
@@ -567,10 +660,10 @@ def rename_track(job_id: str, payload: TrackRename) -> dict:
 
 
 @app.get("/api/stem/{job_id}/{stem}")
-def get_stem(job_id: str, stem: str) -> FileResponse:
+def get_stem(job_id: str, stem: str, pitch: int = 0) -> FileResponse:
     if stem not in STEMS:
         raise HTTPException(404, "unknown stem")
-    path = _track_dir(job_id) / f"{stem}.mp3"
+    path = stem_path(_track_dir(job_id), stem, _parse_pitch(pitch))
     if not path.exists():
         raise HTTPException(404, "stem missing")
     return FileResponse(path, media_type="audio/mpeg")
@@ -583,12 +676,14 @@ def _safe_filename(name: str) -> str:
 
 
 @app.get("/api/mix/{job_id}")
-def mix_stems(job_id: str, stems: str) -> FileResponse:
+def mix_stems(job_id: str, stems: str, pitch: int = 0) -> FileResponse:
     """Mix the selected stems down to a single mp3 and serve it as a download.
 
     `stems` is a comma-separated subset of STEMS. Stems are summed (amix with
     normalize=0) to match the in-app player, which sums stems at unity gain.
+    `pitch` picks one of the pre-rendered pitch versions (semitones, 0 = original).
     """
+    pitch = _parse_pitch(pitch)
     d = _track_dir(job_id)
     if not d.exists():
         raise HTTPException(404, "not found")
@@ -598,7 +693,7 @@ def mix_stems(job_id: str, stems: str) -> FileResponse:
         raise HTTPException(400, "bad stems")
     sel = [s for s in STEMS if s in wanted]  # canonical order
 
-    paths = [d / f"{s}.mp3" for s in sel]
+    paths = [stem_path(d, s, pitch) for s in sel]
     for p in paths:
         if not p.exists():
             raise HTTPException(404, "stem missing")
@@ -608,6 +703,8 @@ def mix_stems(job_id: str, stems: str) -> FileResponse:
     except (FileNotFoundError, json.JSONDecodeError):
         base = job_id
     label = "full" if len(sel) == len(STEMS) else "+".join(sel)
+    if pitch:
+        label += f", {pitch:+d} semitones"
     fname = _safe_filename(f"{base} ({label})") + ".mp3"
 
     # single stem: no mixing needed, stream the file straight through
